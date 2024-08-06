@@ -648,6 +648,53 @@ class LayerNorm(Layer):
                      activation_stored=activation_stored,
                      output_stored=output_stored)
 
+# The calculation of the RMS normalization (RMSNorm) and the residual networks requires 5bsh'
+# https://arxiv.org/html/2404.11502v1
+class RMSNorm(Layer):
+  def __init__(self, name, sys, act_size, hidden,
+               needs_recompute=False, activation_reused=False,
+               activation_stored=True, output_stored=True):
+    super().__init__(name,
+                     sys,
+                     fw_flops=5*act_size,
+                     agrad_flops=10*act_size,
+                     wgrad_flops=4*act_size,
+                     inputs_size=act_size,
+                     output_size=act_size,
+                     activation_space=act_size,
+                     activation_grads=act_size,
+                     weight_space=2*hidden,
+                     weight_grads=2*hidden,
+                     optim_space=2*2*hidden,
+                     needs_recompute=needs_recompute,
+                     activation_reused=activation_reused,
+                     activation_stored=activation_stored,
+                     output_stored=output_stored)
+
+
+# https://arxiv.org/pdf/2404.11502v1.pdf
+# The calculation of relative positional encoding (RoPE) involves 4 multiplications and 2 additions for Q and K matrix, requiring 6bsh
+# We separate Q and K, so it need 3bsh for each
+# for agrad flops and wgrad_flops, we will calulate later
+# class RoPE(Layer):
+#   def __init__(self, name, sys, batch_seq, hidden_size,
+#                needs_recompute=False, activation_reused=False,
+#                activation_stored=True, output_stored=True,batch_size=1):
+#     m, n = batch_seq, hidden_size
+
+#     super().__init__(name,
+#                      sys,
+#                      fw_flops=3*m*n,
+#                      agrad_flops=3*m*n,
+#                      inputs_size=m*n,
+#                      output_size=m*n,
+#                      activation_space=m*n,
+#                      activation_grads=m*n,
+#                      needs_recompute=needs_recompute,
+#                      activation_reused=activation_reused,
+#                      activation_stored=activation_stored,
+#                      output_stored=output_stored)
+
 
 class DropOut(Layer):
   def __init__(self, name, sys, act_size,
@@ -713,6 +760,33 @@ class GeLU(Layer):
   def get_agrad_mem_accessed(self):
     return self.get_fw_mem_accessed()
 
+#https://github.com/tensorflow/lingvo/blob/master/lingvo/core/activations.py
+
+class Swish_GLU(Layer):
+  def __init__(self, name, sys, act_size,
+               needs_recompute=False, activation_reused=False,
+               activation_stored=True, output_stored=True,
+               fused=False):
+    # Fused GeLU runs right after previous Linear layer and does not store
+    # activations or gradients
+    self._fused = fused
+    if fused:
+      eff_act_space = 0
+      eff_act_grads = 0
+    else:
+      eff_act_space = act_size
+      eff_act_grads = act_size        
+    super().__init__(name, sys, fw_flops=6*act_size, agrad_flops=13*act_size,
+                     inputs_size=act_size, output_size=act_size,
+                     activation_space=eff_act_space,
+                     activation_grads=eff_act_grads,
+                     needs_recompute=needs_recompute,
+                     activation_reused=activation_reused,
+                     activation_stored=activation_stored,
+                     output_stored=output_stored)
+
+  def get_agrad_mem_accessed(self):
+    return self.get_fw_mem_accessed()
 
 # https://automata88.medium.com/how-to-implement-the-softmax-derivative-independently-from-any-loss-function-ae6d44363a9d
 class SoftMax(Layer):

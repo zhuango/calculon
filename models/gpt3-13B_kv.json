@@ -1,0 +1,11 @@
+{
+  "hidden": 5140,
+  "feedforward": 20560,
+  "seq_size": 2048,
+  "attn_heads": 40,
+  "kv_heads": 40,
+  "attn_size": 128,
+  "num_blocks": 40,
+  "inference_phrase": "generation",
+  "append_length": 0
+}

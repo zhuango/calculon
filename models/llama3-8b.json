@@ -1,0 +1,17 @@
+{
+  "hidden": 4096,
+  "feedforward": 14336,
+  "seq_size": 4096,
+  "attn_heads": 32,
+  "kv_heads": 8,
+  "attn_size": 128,
+  "num_blocks": 32,
+  "ffn_type": "gated",
+  "norm_type": "rmsnorm",
+  "hidden_act": "silu",
+  "vocab_size": 128256,
+  "pos_encoding": "rope",
+  "tie_emb": false,
+  "attn_type": "flash_attn",
+  "dropout": false
+}

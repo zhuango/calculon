@@ -18,6 +18,15 @@
 from calculon import *
 from .layers import *
 
+NORM_CLASS = {
+  'rmsnorm':RMSNorm,
+  "layernorm":LayerNorm
+}
+
+ACTIVATION_FUNC = {
+  "gelu": GeLU,
+  "silu": Swish_GLU
+}
 
 class Llm:
   """
@@ -36,19 +45,44 @@ class Llm:
       self.feedforward = cfg['feedforward']
       self.seq_size = cfg['seq_size']
       self.attn_heads = cfg['attn_heads']
+      self.kv_heads = cfg.get('kv_heads', self.attn_heads)
       self.attn_size = cfg['attn_size']
       self.num_blocks = cfg['num_blocks']
 
+      # prefill, generation and append
+      self.inference_phrase = cfg.get('inference_phrase', 'prefill')
+      # append phrase with append_length == 0 is equalent to generation phrase.
+      self.append_length = 0
+      if self.inference_phrase == 'append':
+        self.append_length = cfg.get('append_length', 1)
+      
+      self.kv_length = cfg.get('kv_length', self.seq_size)
+      
+      if self.inference_phrase == 'generation':
+        self.seq_size = 1
+      if self.inference_phrase == 'append':
+        self.seq_size = self.append_length
+
+      self.norm_type = NORM_CLASS[cfg.get('norm_type', "layernorm")]
+      self.gated_ffn = cfg.get('ffn_type', 'mlp') == 'gated'
+      self.activation_func = ACTIVATION_FUNC[cfg.get('hidden_act', 'gelu')]
+      self.vocab = cfg.get('vocab_size', 51200)
+      self.position_encoding=cfg.get('pos_encoding', 'emb')
+      self.tie_emb = cfg.get('tie_emb', True)
+      self.use_flash_attn = cfg.get('attn_type', ) == 'flash_attn'
+      self.use_dropout = cfg.get('dropout', True)
+      
     def num_parameters(self):
       # https://cs.stanford.edu/~matei/papers/2021/sc_megatron_lm.pdf
       # Equation 2
-      p = 2 * self.hidden * self.feedforward                   # MLP weights
+      p = (3 if self.gated_ffn else 2) * self.hidden * self.feedforward                   # MLP weights
       p += 4 * self.hidden * self.attn_heads * self.attn_size  # Attn weights
       p += self.hidden + self.feedforward                      # biases MLP
       p += 3 * self.attn_heads * self.attn_size + self.hidden  # biases Attn
       p += 2 * 2 * self.hidden                                 # layer norm
       p *= self.num_blocks                                     # per each block
-      p += (51200 + self.seq_size) * self.hidden               # embeddings
+      p += (self.vocab *(1 if self.tie_emb else 2) + (self.seq_size if self.position_encoding =='emb' else 0)) * self.hidden               # embeddings
+
       return p
 
   class Execution:
@@ -66,6 +100,8 @@ class Llm:
 
     @staticmethod
     def from_json(cfg):
+      # print(cfg.keys())
+      # print(Llm.Execution.fields())
       assert set(cfg.keys()) == set(Llm.Execution.fields())
       values = [cfg[field] for field in Llm.Execution.fields()]
       return Llm.Execution(*values)
@@ -103,7 +139,7 @@ class Llm:
       self.datatype = datatype
       self.fused_activation = fused_activation
       self.attention_type = attention_type
-      assert self.attention_type in ['multihead', 'multiquery']
+      assert self.attention_type in ['multihead', 'multiquery', 'groupedquery']
       self.activation_recompute = activation_recompute
       assert self.activation_recompute in ['full', 'attn_only', 'none']
       if self.activation_recompute in ['full', 'attn_only']:
@@ -660,7 +696,7 @@ class Llm:
       needs_recompute=recompute_flag,
       # We account this activation when consider Residual and LayerNorm
       activation_stored=True))
-    self._llm_block.append(LayerNorm(
+    self._llm_block.append(self.app.norm_type(
       "AttnBlock_LayerNorm",
       self.sys,
       pick(self.exe._sequence_par, self._seq_par_activation_size,
@@ -747,6 +783,29 @@ class Llm:
           # Activation is stored in Fork instead,
           activation_stored=False,
           activation_reused=True))
+      elif self.exe.attention_type == 'groupedquery':
+        # Grouped query attention uses the same K, V for each group of "heads" resulting in
+        # smaller Wk and Wv, less matmul, faster inference
+        self._llm_block.append(Linear(
+          "AttnBlock_Key",
+          self.sys,
+          self._batch_seq,
+          self.app.hidden,
+          self.app.kv_heads * self.app.attn_size // self.exe.tensor_par,
+          needs_recompute=recompute_flag,
+          # Activation is stored in Fork instead,
+          activation_stored=False,
+          activation_reused=True))
+        self._llm_block.append(Linear(
+          "AttnBlock_Value",
+          self.sys,
+          self._batch_seq,
+          self.app.hidden,
+          self.app.kv_heads * self.app.attn_size // self.exe.tensor_par,
+          needs_recompute=recompute_flag,
+          # Activation is stored in Fork instead,
+          activation_stored=False,
+          activation_reused=True))
       else:
         raise self.Error('Wrong attention type', self.exe.attention_type)
     else:
@@ -809,13 +868,57 @@ class Llm:
           # Activation is stored in Fork instead,
           activation_stored=False,
           activation_reused=True))
+      elif self.exe.attention_type == 'groupedquery':
+        self._llm_block.append(LinearOverlapped(
+          "AttnBlock_Query_AG",
+          self.sys,
+          self._batch_seq,
+          self.app.hidden,
+          self.app.attn_heads * self.app.attn_size,
+          self.exe.tensor_par_comm_type,
+          self.exe.tensor_par,
+          self.exe.tensor_par_net,
+          self.exe.tensor_par,
+          conjugate=False,
+          tp_overlap=self.exe.tensor_par_overlap,
+          needs_recompute=recompute_flag,
+          needs_recomm=recompute_ag_flag))
+        self._llm_block.append(Fork(
+          "AttnBlock_KV_Fork",
+          self.sys,
+          self._activation_size,
+          self.app.kv_heads * 2,
+          needs_recompute=recompute_ag_flag,
+          # With seq_par, we use activations from Comm layers to reflect that
+          # they're split, otherwise we keep full size activations
+          activation_stored=(not recompute_ag_flag)))
+        self._llm_block.append(Linear(
+          "AttnBlock_Key",
+          self.sys,
+          self._batch_seq,
+          self.app.hidden,
+          self.app.kv_heads * self.app.attn_size,
+          needs_recompute=recompute_flag,
+          # Activation is stored in Fork instead,
+          activation_stored=False,
+          activation_reused=True))
+        self._llm_block.append(Linear(
+          "AttnBlock_Value",
+          self.sys,
+          self._batch_seq,
+          self.app.hidden,
+          self.app.kv_heads * self.app.attn_size,
+          needs_recompute=recompute_flag,
+          # Activation is stored in Fork instead,
+          activation_stored=False,
+          activation_reused=True))
       else:
         raise self.Error('Wrong attention type', self.exe.attention_type)
     self._llm_block.append(BatchMatMul(
       "AttnBlock_Multihead_Key_Query",
       self.sys,
       self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
-      self.app.seq_size,
+      self.app.kv_length,
       self.app.attn_size,
       self.app.seq_size,
       needs_recompute=recompute_attn_flag,
@@ -824,21 +927,23 @@ class Llm:
       "AttnBlock_Multihead_SoftMax",
       self.sys,
       self.app.attn_heads // self.exe.tensor_par * \
-        self.app.seq_size**2 * self.exe.microbatch_size,
+        self.app.seq_size*self.app.kv_length * self.exe.microbatch_size,
       needs_recompute=recompute_attn_flag,
       output_stored=(not recompute_attn_flag)))
-    self._llm_block.append(DropOut(
-      "AttnBlock_Multihead_DropOut",
-      self.sys,
-      self.app.attn_heads // self.exe.tensor_par * \
-        self.app.seq_size**2 * self.exe.microbatch_size,
-      needs_recompute=recompute_attn_flag,
-      activation_stored=(not recompute_attn_flag)))
+    
+    if self.exe.training and self.app.use_dropout:
+      self._llm_block.append(DropOut(
+        "AttnBlock_Multihead_DropOut",
+        self.sys,
+        self.app.attn_heads // self.exe.tensor_par * \
+          self.app.seq_size*self.app.kv_length * self.exe.microbatch_size,
+        needs_recompute=recompute_attn_flag,
+        activation_stored=(not recompute_attn_flag)))
     self._llm_block.append(BatchMatMul(
       "AttnBlock_Multihead_Attn",
       self.sys,
       self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
-      self.app.seq_size,
+      self.app.kv_length,
       self.app.seq_size,
       self.app.attn_heads * self.app.attn_size // self.app.attn_heads,
       needs_recompute=recompute_flag))
@@ -880,12 +985,13 @@ class Llm:
         tp_overlap=self.exe.tensor_par_overlap,
         needs_recompute=recompute_flag,
         needs_recomm=recompute_flag))
-    self._llm_block.append(DropOut(
-      "AttnBlock_DropOut",
-      self.sys,
-      pick(self.exe._sequence_par, self._seq_par_activation_size,
-           self._activation_size),
-      needs_recompute=recompute_flag))
+    if self.exe.training and self.app.use_dropout:
+      self._llm_block.append(DropOut(
+        "AttnBlock_DropOut",
+        self.sys,
+        pick(self.exe._sequence_par, self._seq_par_activation_size,
+            self._activation_size),
+        needs_recompute=recompute_flag))
     self._llm_block.append(ElementWise(
       "AttnBlock_Residual",
       self.sys,
@@ -911,7 +1017,7 @@ class Llm:
       needs_recompute=recompute_flag,
       # We account this activation when consider Residual and LayerNorm
       activation_stored=True))
-    self._llm_block.append(LayerNorm(
+    self._llm_block.append(self.app.norm_type(
       "MlpBlock_LayerNorm",
       self.sys,
       pick(self.exe._sequence_par, self._seq_par_activation_size,
@@ -947,6 +1053,18 @@ class Llm:
         # With seq_par, we use activations from Comm layers to reflect that
         # they're split, otherwise we keep full size activations
         activation_stored=(not recompute_ag_flag)))
+      if self.app.gated_ffn:
+        self._llm_block.append(Linear(
+          "MlpBlock_Mlp2",
+          self.sys,
+          self._batch_seq,
+          self.app.hidden,
+          self.app.feedforward // self.exe.tensor_par,
+          needs_recompute=recompute_flag,
+          # With seq_par, we use activations from Comm layers to reflect that
+          # they're split, otherwise we keep full size activations
+          activation_stored=False))
+
     else:
       self._llm_block.append(LinearOverlapped(
         "MlpBlock_Mlp1_AG",
@@ -962,8 +1080,8 @@ class Llm:
         tp_overlap=self.exe.tensor_par_overlap,
         needs_recompute=recompute_flag,
         needs_recomm=recompute_ag_flag))
-    self._llm_block.append(GeLU(
-      "MlpBlock_GeLU",
+    self._llm_block.append(self.app.activation_func(
+      "MlpBlock_ACT",
       self.sys,
       self.app.feedforward * self._batch_seq // self.exe.tensor_par,
       needs_recompute=recompute_flag,
@@ -1006,12 +1124,13 @@ class Llm:
         tp_overlap=self.exe.tensor_par_overlap,
         needs_recompute=recompute_flag,
         needs_recomm=recompute_flag))
-    self._llm_block.append(DropOut(
-      "MlpBlock_DropOut",
-      self.sys,
-      pick(self.exe._sequence_par, self._seq_par_activation_size,
-           self._activation_size),
-      needs_recompute=recompute_flag))
+    if self.exe.training and self.app.use_dropout:
+      self._llm_block.append(DropOut(
+        "MlpBlock_DropOut",
+        self.sys,
+        pick(self.exe._sequence_par, self._seq_par_activation_size,
+            self._activation_size),
+        needs_recompute=recompute_flag))
     self._llm_block.append(ElementWise(
       "MlpBlock_Residual",
       self.sys,
@@ -1115,14 +1234,14 @@ class Llm:
       size[self.exe.data_par_net] *= self.exe.data_par
     self._dp_net = self.sys.get_network(self.exe.data_par_net)
 
-    for tier_used, tier_size, tier in zip(
-        used, size, range(self.sys.num_networks)):
-      if tier_used:
-        if tier_size > self.sys.get_network(tier).size:
-          raise self.Error(f'Network tier{tier} isn\'t big enough')
-        if (self.sys.get_network(tier).must_be_filled and
-            self.sys.get_network(tier).size % tier_size != 0):
-          raise self.Error(f'Network tier{tier} isn\'t fully used')
+    # for tier_used, tier_size, tier in zip(
+    #     used, size, range(self.sys.num_networks)):
+    #   if tier_used:
+    #     if tier_size > self.sys.get_network(tier).size:
+    #       raise self.Error(f'Network tier{tier} isn\'t big enough')
+    #     if (self.sys.get_network(tier).must_be_filled and
+    #         self.sys.get_network(tier).size % tier_size != 0):
+    #       raise self.Error(f'Network tier{tier} isn\'t fully used')
 
   def _compute_block_stats(self):
     """
@@ -1195,6 +1314,7 @@ class Llm:
     for layer in self._llm_block:
       # Add flops/bytes/times per layer
       self._block_fw_flops += layer.get_fw_flops()
+      # print(layer, layer.get_fw_flops(), "Total: ", self._block_fw_flops)
       self._block_fw_flops_time += layer.compute_flops_time("fw")
       self._block_fw_mem_accessed += layer.get_fw_mem_accessed()
       self._block_fw_mem_time += layer.compute_mem_time("fw")
@@ -1272,11 +1392,14 @@ class Llm:
       if not layer.reuses_activation():
         self._block_act_working_space += layer.get_activation()
       self._block_act_storage_space += layer.get_activation()
+      # print("total: ", self._block_act_storage_space, layer.get_activation())
       if self.exe.training:
         if not layer.stores_output():
           self._block_act_storage_space -= layer.get_output()
         if not layer.stores_activation():
           self._block_act_storage_space -= layer.get_activation()
+        # print(layer, layer.stores_activation(), layer.stores_output(), " store act or not.", layer.stores_activation()*layer.get_activation(), layer.stores_output()*layer.get_output())
+        # print("total: ", self._block_act_storage_space)
         self._block_weight_grad_space += layer.get_weight_grad()
         self._block_weight_grad_space_no_sharding += layer.get_weight_grad(
           sharded=False)
@@ -1860,7 +1983,9 @@ class Llm:
                    human_format(self._dp_bw_overlap_req_tail, "bandwidth"))
 
     # memory capacity stats
+    # self._weight_space = self.app.num_parameters() * self._bytes_per_element
     self._weight_space = self._block_weight_space * self._blocks_per_proc
+    
     # account for activation recomputation
     # for full recompute we keep single block's activations
     # (no scaling by L/gpu)
