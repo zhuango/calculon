@@ -1055,7 +1055,7 @@ class Llm:
         activation_stored=(not recompute_ag_flag)))
       if self.app.gated_ffn:
         self._llm_block.append(Linear(
-          "MlpBlock_Mlp2",
+          "MlpBlock_Mlp_gate",
           self.sys,
           self._batch_seq,
           self.app.hidden,
