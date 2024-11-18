@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
 """
+import math
 
 from calculon import *
 
@@ -624,6 +625,121 @@ class BatchMatMul(Layer):
 
   def use_matrix_engine(self):
     return True
+
+class FlashAttn(Layer):
+  def __init__(self, name, sys, batch, seq_length, kv_length, num_head, head_dim,
+               needs_recompute=False, activation_reused=False,
+               activation_stored=True, output_stored=True, dropout=False, num_kv_head=8, block_size=16):
+    
+    tensor_core_factor = sys.matrix.flops(sys.datatype) / sys.vector.flops(sys.datatype)
+
+    # flops
+    flops_logits = batch*2*num_head*seq_length*kv_length*head_dim
+    
+    flops_softmax = batch*num_head*seq_length*kv_length * 5
+    flops_softmax *= tensor_core_factor
+
+    flops_dpr = batch*num_head*seq_length*kv_length*float(dropout)
+    flops_dpr *= tensor_core_factor
+
+    flops_attn = batch * num_head * seq_length * head_dim * kv_length * 2
+    flops_fwd = flops_logits + flops_softmax + flops_dpr + flops_attn
+    
+
+    #total mem
+    activation_in_mem = (batch * num_head * seq_length * head_dim) # Q
+    activation_in_mem += 2 * (batch * num_head * kv_length * head_dim) # # K and V
+    activation_in_mem += (batch * num_head * seq_length) # # stats for softmax
+    activation_out_mem = (batch * num_head * seq_length * head_dim) #  # result
+
+    activation_buffer = batch * num_head * seq_length * head_dim #  # q, k, v 
+    activation_buffer += 2 * (batch * num_head * kv_length * head_dim) #  # q, k, v 
+    activation_buffer += (batch * num_head * seq_length) #  # random number generator states (droppout mask is not stored); dont know if this is float
+    activation_buffer += (batch * num_head * seq_length) #  # stats for softmax
+    
+    # TODO: in software this might be stored (even though the next layer will have it: might need to revisit if not
+    activation_buffer += (batch * num_head * seq_length * head_dim) # # result for flashattn bwd
+    weights_mem = 0
+    mem_fwd = activation_in_mem + activation_out_mem #+ weights_mem
+
+    ####### backward pass #######
+    # logits
+    flops_bwd = 2 * batch * num_head * seq_length * head_dim * (kv_length * 2)
+    # softmax
+    flops_softmax = batch * num_head * seq_length * kv_length * 8
+    flops_softmax *= tensor_core_factor # wont use tensor cores
+    flops_bwd += flops_softmax
+    # dropout
+    flops_dpr = batch * num_head * seq_length * kv_length *float(dropout)#  * flops_per_mult
+    flops_dpr *= tensor_core_factor # wont use tensor cores
+    flops_bwd += flops_dpr
+    # attend
+    flops_bwd += batch * num_head * seq_length * kv_length * head_dim * 2
+    flops_bwd += batch * num_head * seq_length * head_dim * kv_length * 2
+
+    # extra fwd flops since attn is remat
+    # logit
+    flops_bwd +=  batch * num_head * seq_length * kv_length * head_dim * 2
+    # softmax
+    flops_softmax = batch * num_head * seq_length * kv_length * 5
+    flops_softmax *= tensor_core_factor # wont use tensor cores
+    flops_bwd += flops_softmax
+    # dropout
+    flops_dpr = (batch * num_head * seq_length * kv_length)*float(dropout)
+    flops_dpr *= tensor_core_factor # wont use tensor cores
+    flops_bwd += flops_dpr
+
+    # mem
+    activation_grad_mem = 2 * (batch * num_head * seq_length * head_dim)  # dq, dresult
+    activation_grad_mem += 2 * (batch * num_head * kv_length * head_dim)  # dk, dv
+    mem_bwd = activation_grad_mem + activation_buffer
+    
+    self.seq_length = seq_length
+    self.kv_length = kv_length
+    self.block_size = block_size
+    self.head_dim = head_dim
+    self.num_head = num_head
+    self.num_kv_head = num_kv_head
+    
+    super().__init__(name,
+                     sys,
+                     fw_flops=flops_fwd,
+                     agrad_flops=flops_bwd,
+                     inputs_size=batch*(seq_length + kv_length*2)*num_head*head_dim,
+                     output_size=batch*seq_length*num_head*head_dim,
+                     activation_space=mem_fwd,
+                     activation_grads=activation_grad_mem,
+                     needs_recompute=needs_recompute,
+                     activation_reused=activation_reused,
+                     activation_stored=activation_stored,
+                     output_stored=output_stored
+    )
+
+  def get_fw_mem_accessed(self):
+    seql= self.seq_length
+    kv_length = self.kv_length
+    block_size = self.block_size
+    d = self.head_dim * self.num_head
+
+    num_block = math.ceil(seql/block_size)
+    # outer loop, Load Qi from HBM to on-chip SRAM
+    # outer loop, Write O𝑖, ℓ𝑖, 𝑚𝑖 to HBM.
+    step_1 = 2*seql*d + 2*seql
+    # inter loop, 
+    #   Load K𝑗, V𝑗, from HBM to on-chip SRAM.
+    #   
+    step_2 = 2*kv_length*(self.head_dim*self.num_kv_head) * num_block# * 0.8
+
+    
+    mem_accessed = step_1 + step_2
+
+
+    mem_accessed *= self.bytes_per_element
+    return mem_accessed
+
+  def use_matrix_engine(self):
+    return True
+
 
 # https://kratzert.github.io/2016/02/12/understanding-the-gradient-flow-through-the-batch-normalization-layer.html
 # https://cthorey.github.io./blog/2016/backpropagation/

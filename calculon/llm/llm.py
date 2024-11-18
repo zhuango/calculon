@@ -69,7 +69,7 @@ class Llm:
       self.vocab = cfg.get('vocab_size', 51200)
       self.position_encoding=cfg.get('pos_encoding', 'emb')
       self.tie_emb = cfg.get('tie_emb', True)
-      self.use_flash_attn = cfg.get('attn_type', ) == 'flash_attn'
+      self.use_flash_attn = cfg.get('attn_type', 'std') == 'flash_attn'
       self.use_dropout = cfg.get('dropout', True)
       
     def num_parameters(self):
@@ -914,39 +914,52 @@ class Llm:
           activation_reused=True))
       else:
         raise self.Error('Wrong attention type', self.exe.attention_type)
-    self._llm_block.append(BatchMatMul(
-      "AttnBlock_Multihead_Key_Query",
-      self.sys,
-      self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
-      self.app.kv_length,
-      self.app.attn_size,
-      self.app.seq_size,
-      needs_recompute=recompute_attn_flag,
-      output_stored=(not recompute_attn_flag)))
-    self._llm_block.append(SoftMax(
-      "AttnBlock_Multihead_SoftMax",
-      self.sys,
-      self.app.attn_heads // self.exe.tensor_par * \
-        self.app.seq_size*self.app.kv_length * self.exe.microbatch_size,
-      needs_recompute=recompute_attn_flag,
-      output_stored=(not recompute_attn_flag)))
-    
-    if self.exe.training and self.app.use_dropout:
-      self._llm_block.append(DropOut(
-        "AttnBlock_Multihead_DropOut",
+    if self.app.use_flash_attn:
+      self._llm_block.append(FlashAttn(
+        "flash_attention",
+        self.sys,
+        self.exe.microbatch_size, 
+        self.app.seq_size, 
+        self.app.kv_length,
+        self.app.attn_heads // self.exe.tensor_par, 
+        self.app.attn_size,
+        num_kv_head=self.app.kv_heads // self.exe.tensor_par, 
+        needs_recompute=True,
+        activation_stored=True, output_stored=True, dropout=(self.exe.training and self.app.use_dropout)))
+    else:
+      self._llm_block.append(BatchMatMul(
+        "AttnBlock_Multihead_Key_Query",
+        self.sys,
+        self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
+        self.app.kv_length,
+        self.app.attn_size,
+        self.app.seq_size,
+        needs_recompute=recompute_attn_flag,
+        output_stored=(not recompute_attn_flag)))
+      self._llm_block.append(SoftMax(
+        "AttnBlock_Multihead_SoftMax",
         self.sys,
         self.app.attn_heads // self.exe.tensor_par * \
           self.app.seq_size*self.app.kv_length * self.exe.microbatch_size,
         needs_recompute=recompute_attn_flag,
-        activation_stored=(not recompute_attn_flag)))
-    self._llm_block.append(BatchMatMul(
-      "AttnBlock_Multihead_Attn",
-      self.sys,
-      self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
-      self.app.kv_length,
-      self.app.seq_size,
-      self.app.attn_heads * self.app.attn_size // self.app.attn_heads,
-      needs_recompute=recompute_flag))
+        output_stored=(not recompute_attn_flag)))
+      
+      if self.exe.training and self.app.use_dropout:
+        self._llm_block.append(DropOut(
+          "AttnBlock_Multihead_DropOut",
+          self.sys,
+          self.app.attn_heads // self.exe.tensor_par * \
+            self.app.seq_size*self.app.kv_length * self.exe.microbatch_size,
+          needs_recompute=recompute_attn_flag,
+          activation_stored=(not recompute_attn_flag)))
+      self._llm_block.append(BatchMatMul(
+        "AttnBlock_Multihead_Attn",
+        self.sys,
+        self.exe.microbatch_size * self.app.attn_heads // self.exe.tensor_par,
+        self.app.kv_length,
+        self.app.seq_size,
+        self.app.attn_heads * self.app.attn_size // self.app.attn_heads,
+        needs_recompute=recompute_flag))
     if self.exe.tensor_par_overlap == 'none':
       self._llm_block.append(Linear(
         "AttnBlock_MLP",
